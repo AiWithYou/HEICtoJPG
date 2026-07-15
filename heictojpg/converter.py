@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from PIL import Image, ImageOps, UnidentifiedImageError, features
+from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError, features
 from pillow_heif import register_heif_opener
 
 from heictojpg.config import (
@@ -51,6 +51,11 @@ PIL_FORMATS = {
     FORMAT_WEBP: "WEBP",
 }
 GPS_INFO_TAG = 34853
+EXIF_IFD_TAG = int(ExifTags.IFD.Exif)
+IMAGE_WIDTH_TAG = int(ExifTags.Base.ImageWidth)
+IMAGE_HEIGHT_TAG = int(ExifTags.Base.ImageLength)
+EXIF_IMAGE_WIDTH_TAG = int(ExifTags.Base.ExifImageWidth)
+EXIF_IMAGE_HEIGHT_TAG = int(ExifTags.Base.ExifImageHeight)
 WINDOWS_FILE_ATTRIBUTE_HIDDEN = 0x02
 WINDOWS_INVALID_FILE_ATTRIBUTES = -1
 
@@ -124,6 +129,11 @@ def convert_files(
             results.append(_convert_file_with_settings(source_path, active_settings))
         except (ConversionError, OSError) as exc:
             results.append(_failed_result(source_path, active_settings, str(exc)))
+        except (MemoryError, RecursionError):
+            raise
+        except Exception as exc:
+            error = str(exc) or type(exc).__name__
+            results.append(_failed_result(source_path, active_settings, error))
     return results
 
 
@@ -133,24 +143,61 @@ def convert_folder(
     recursive: bool = False,
     settings: AppConfig | None = None,
 ) -> list[ConversionResult]:
-    sources = list_source_images(folder, recursive=recursive)
+    active_settings = validate_config(settings or AppConfig())
+    folder_path = Path(folder)
+    excluded_directory_names: tuple[str, ...] = ()
+    excluded_directories: tuple[Path, ...] = ()
+    if active_settings.output_mode == OUTPUT_MODE_CONVERTED_SUBFOLDER:
+        excluded_directory_names = ("converted",)
+    elif (
+        active_settings.output_mode == OUTPUT_MODE_FIXED_FOLDER
+        and active_settings.output_dir is not None
+        and _is_strictly_within(active_settings.output_dir, folder_path)
+    ):
+        excluded_directories = (active_settings.output_dir,)
+
+    sources = list_source_images(
+        folder_path,
+        recursive=recursive,
+        excluded_directory_names=excluded_directory_names,
+        excluded_directories=excluded_directories,
+    )
     if not sources:
         return []
-    return convert_files(sources, settings=settings or AppConfig())
+    return convert_files(sources, settings=active_settings)
 
 
-def list_source_images(folder: Path | str, *, recursive: bool = False) -> list[Path]:
+def list_source_images(
+    folder: Path | str,
+    *,
+    recursive: bool = False,
+    excluded_directory_names: Iterable[str] = (),
+    excluded_directories: Iterable[Path | str] = (),
+) -> list[Path]:
     folder_path = Path(folder)
     if not folder_path.exists():
         raise ConversionError(f"Source folder does not exist: {folder_path}")
     if not folder_path.is_dir():
         raise ConversionError(f"Source path is not a folder: {folder_path}")
 
-    iterator = folder_path.rglob("*") if recursive else folder_path.glob("*")
+    excluded_names = {name.casefold() for name in excluded_directory_names}
+    excluded_roots = tuple(Path(path).resolve() for path in excluded_directories)
+    iterator = (
+        _walk_files(folder_path, excluded_names=excluded_names, excluded_roots=excluded_roots)
+        if recursive
+        else folder_path.glob("*")
+    )
     return sorted(
         path
         for path in iterator
-        if path.is_file() and path.suffix.lower() in SUPPORTED_SOURCE_SUFFIXES
+        if path.is_file()
+        and path.suffix.lower() in SUPPORTED_SOURCE_SUFFIXES
+        and not _is_in_excluded_directory(
+            path,
+            folder_path=folder_path,
+            excluded_names=excluded_names,
+            excluded_roots=excluded_roots,
+        )
     )
 
 
@@ -206,11 +253,17 @@ def _convert_file_with_settings(source_path: Path, settings: AppConfig) -> Conve
         with Image.open(source_path) as image:
             image.load()
             normalized = ImageOps.exif_transpose(image)
-            output_image = _image_for_format(normalized, settings.output_format)
+            resized = _resize_image(normalized, settings.max_dimension)
+            output_image = _image_for_format(resized, settings.output_format)
             if not settings.keep_icc_profile:
                 output_image = _remove_icc_profile(output_image)
             save_kwargs = _save_kwargs(output_image, settings)
-            exif = _exif_bytes(normalized, keep_exif=settings.keep_exif, remove_gps=settings.remove_gps)
+            exif = _exif_bytes(
+                resized,
+                keep_exif=settings.keep_exif,
+                remove_gps=settings.remove_gps,
+                output_size=output_image.size,
+            )
             if exif:
                 save_kwargs["exif"] = exif
             icc_profile = _icc_profile_bytes(
@@ -220,11 +273,21 @@ def _convert_file_with_settings(source_path: Path, settings: AppConfig) -> Conve
             )
             if icc_profile:
                 save_kwargs["icc_profile"] = icc_profile
-            _save_image_atomically(output_image, target_path, save_kwargs)
     except UnidentifiedImageError as exc:
         raise ConversionError(f"Source file is not a readable image: {source_path}") from exc
+    except (Image.DecompressionBombError, SyntaxError, ValueError) as exc:
+        raise ConversionError(
+            f"Source image could not be processed '{source_path}': {exc}"
+        ) from exc
     except OSError as exc:
-        raise ConversionError(f"Failed to convert image '{source_path}': {exc}") from exc
+        raise ConversionError(f"Failed to read or transform image '{source_path}': {exc}") from exc
+
+    try:
+        _save_image_atomically(output_image, target_path, save_kwargs)
+    except (OSError, SyntaxError, ValueError) as exc:
+        raise ConversionError(
+            f"Failed to encode or save image '{source_path}' to '{target_path}': {exc}"
+        ) from exc
 
     return ConversionResult(source=source_path, target=target_path)
 
@@ -256,7 +319,9 @@ def _validate_source(source_path: Path) -> None:
         raise ConversionError(f"Source path is not a file: {source_path}")
     if source_path.suffix.lower() not in SUPPORTED_SOURCE_SUFFIXES:
         allowed = ", ".join(sorted(SUPPORTED_SOURCE_SUFFIXES))
-        raise ConversionError(f"Unsupported file extension '{source_path.suffix}'. Expected {allowed}.")
+        raise ConversionError(
+            f"Unsupported file extension '{source_path.suffix}'. Expected {allowed}."
+        )
 
 
 def _target_dir_for_source(source_path: Path, settings: AppConfig) -> Path:
@@ -308,6 +373,22 @@ def _image_for_format(image: Image.Image, output_format: str) -> Image.Image:
     raise ConversionError(f"Unsupported output format: {output_format}")
 
 
+def _resize_image(image: Image.Image, max_dimension: int | None) -> Image.Image:
+    if max_dimension is None or max(image.size) <= max_dimension:
+        return image
+
+    resize_source = image
+    if image.mode in {"1", "P"}:
+        resize_source = image.convert("RGBA" if _has_alpha(image) else "RGB")
+    resized = resize_source.copy()
+    resized.thumbnail(
+        (max_dimension, max_dimension),
+        Image.Resampling.LANCZOS,
+        reducing_gap=3.0,
+    )
+    return resized
+
+
 def _to_rgb_on_white(image: Image.Image) -> Image.Image:
     if _has_alpha(image):
         background = Image.new("RGB", image.size, (255, 255, 255))
@@ -320,7 +401,7 @@ def _to_rgb_on_white(image: Image.Image) -> Image.Image:
 
 
 def _has_alpha(image: Image.Image) -> bool:
-    return image.mode in {"RGBA", "LA"} or "transparency" in image.info
+    return "A" in image.getbands() or "transparency" in image.info
 
 
 def _remove_icc_profile(image: Image.Image) -> Image.Image:
@@ -379,10 +460,13 @@ def _set_hidden_attribute(path: Path) -> None:
     attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
     if attributes == WINDOWS_INVALID_FILE_ATTRIBUTES:
         raise OSError(f"Failed to read temporary output file attributes: {path}")
-    if ctypes.windll.kernel32.SetFileAttributesW(
-        str(path),
-        attributes | WINDOWS_FILE_ATTRIBUTE_HIDDEN,
-    ) == 0:
+    if (
+        ctypes.windll.kernel32.SetFileAttributesW(
+            str(path),
+            attributes | WINDOWS_FILE_ATTRIBUTE_HIDDEN,
+        )
+        == 0
+    ):
         raise OSError(f"Failed to hide temporary output file: {path}")
 
 
@@ -392,14 +476,23 @@ def _clear_hidden_attribute(path: Path) -> None:
     attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
     if attributes == WINDOWS_INVALID_FILE_ATTRIBUTES:
         raise OSError(f"Failed to read output file attributes: {path}")
-    if ctypes.windll.kernel32.SetFileAttributesW(
-        str(path),
-        attributes & ~WINDOWS_FILE_ATTRIBUTE_HIDDEN,
-    ) == 0:
+    if (
+        ctypes.windll.kernel32.SetFileAttributesW(
+            str(path),
+            attributes & ~WINDOWS_FILE_ATTRIBUTE_HIDDEN,
+        )
+        == 0
+    ):
         raise OSError(f"Failed to unhide output file: {path}")
 
 
-def _exif_bytes(image: Image.Image, *, keep_exif: bool, remove_gps: bool) -> bytes | None:
+def _exif_bytes(
+    image: Image.Image,
+    *,
+    keep_exif: bool,
+    remove_gps: bool,
+    output_size: tuple[int, int],
+) -> bytes | None:
     if not keep_exif:
         return None
     exif = image.getexif()
@@ -407,9 +500,27 @@ def _exif_bytes(image: Image.Image, *, keep_exif: bool, remove_gps: bool) -> byt
         return None
     if remove_gps and GPS_INFO_TAG in exif:
         del exif[GPS_INFO_TAG]
+    _update_exif_dimensions(exif, output_size)
     if not exif:
         return None
     return exif.tobytes()
+
+
+def _update_exif_dimensions(exif: Image.Exif, output_size: tuple[int, int]) -> None:
+    width, height = output_size
+    for tag, value in ((IMAGE_WIDTH_TAG, width), (IMAGE_HEIGHT_TAG, height)):
+        if tag in exif:
+            exif[tag] = value
+
+    if EXIF_IFD_TAG not in exif:
+        return
+    exif_ifd = exif.get_ifd(EXIF_IFD_TAG)
+    for tag, value in (
+        (EXIF_IMAGE_WIDTH_TAG, width),
+        (EXIF_IMAGE_HEIGHT_TAG, height),
+    ):
+        if tag in exif_ifd:
+            exif_ifd[tag] = value
 
 
 def _icc_profile_bytes(
@@ -427,3 +538,56 @@ def _icc_profile_bytes(
         if isinstance(icc_profile, bytearray) and icc_profile:
             return bytes(icc_profile)
     return None
+
+
+def _is_strictly_within(path: Path, parent: Path) -> bool:
+    resolved_path = path.resolve()
+    resolved_parent = parent.resolve()
+    return resolved_path != resolved_parent and resolved_path.is_relative_to(resolved_parent)
+
+
+def _is_in_excluded_directory(
+    path: Path,
+    *,
+    folder_path: Path,
+    excluded_names: set[str],
+    excluded_roots: tuple[Path, ...],
+) -> bool:
+    if excluded_names:
+        relative_parent_parts = path.relative_to(folder_path).parts[:-1]
+        if any(part.casefold() in excluded_names for part in relative_parent_parts):
+            return True
+
+    resolved_path = path.resolve()
+    return any(resolved_path.is_relative_to(root) for root in excluded_roots)
+
+
+def _walk_files(
+    folder_path: Path,
+    *,
+    excluded_names: set[str],
+    excluded_roots: tuple[Path, ...],
+) -> Iterable[Path]:
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for current_root, directory_names, file_names in os.walk(
+        folder_path,
+        onerror=raise_walk_error,
+    ):
+        current_path = Path(current_root)
+        kept_directories: list[str] = []
+        for directory_name in directory_names:
+            directory_path = current_path / directory_name
+            resolved_directory = directory_path.resolve()
+            if directory_name.casefold() in excluded_names:
+                continue
+            if any(
+                resolved_directory == root or resolved_directory.is_relative_to(root)
+                for root in excluded_roots
+            ):
+                continue
+            kept_directories.append(directory_name)
+        directory_names[:] = sorted(kept_directories, key=str.casefold)
+        for file_name in sorted(file_names, key=str.casefold):
+            yield current_path / file_name

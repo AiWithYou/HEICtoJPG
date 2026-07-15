@@ -48,7 +48,7 @@ def _capture_converter(language: str, output_path: Path) -> None:
         window = ConverterWindow(root)
         window.language = language
         window._apply_language()
-        _capture_root(root, output_path, geometry="1280x900+80+80")
+        _capture_root(root, output_path, geometry="1280x950+20+0")
     finally:
         root.destroy()
 

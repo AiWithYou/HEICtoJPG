@@ -52,7 +52,7 @@ $WshShell = New-Object -ComObject WScript.Shell
 $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
 $Shortcut.TargetPath = $VenvPythonw
 $Shortcut.Arguments = '-m heictojpg settings'
-$Shortcut.WorkingDirectory = $ProjectRoot
+$Shortcut.WorkingDirectory = $InstallRoot
 $Shortcut.IconLocation = "$env:SystemRoot\System32\imageres.dll,-70"
 $Shortcut.Save()
 

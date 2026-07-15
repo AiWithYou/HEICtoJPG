@@ -8,6 +8,7 @@ $WorkDir = Join-Path $BuildDir 'work'
 $DistDir = Join-Path $ProjectRoot 'dist'
 $PackageDir = Join-Path $DistDir 'HEICConverter'
 $ZipPath = Join-Path $DistDir 'HEICConverter.zip'
+$LegacyExePath = Join-Path $DistDir 'HEICConverter.exe'
 $LicenseOutputDir = Join-Path $PackageDir 'licenses'
 $LegalTemplateDir = Join-Path $ProjectRoot 'licenses'
 $EntryPoint = Join-Path $ProjectRoot 'heictojpg\app_main.py'
@@ -168,6 +169,7 @@ Invoke-NativeCommand -FilePath $VenvPython -Arguments @('-m', 'pip', 'install', 
 New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 Remove-DirectoryInside -TargetPath $PackageDir -ParentPath $DistDir
 Remove-FileInside -TargetPath $ZipPath -ParentPath $DistDir
+Remove-FileInside -TargetPath $LegacyExePath -ParentPath $DistDir
 New-Item -ItemType Directory -Force -Path $PackageDir | Out-Null
 
 Invoke-NativeCommand -FilePath $VenvPython -Arguments @(

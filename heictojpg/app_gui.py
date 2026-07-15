@@ -7,7 +7,8 @@ import threading
 from pathlib import Path
 from tkinter import (
     BooleanVar,
-    IntVar,
+    Canvas,
+    Misc,
     StringVar,
     Tcl,
     Tk,
@@ -35,9 +36,11 @@ from heictojpg.config import (
     AppConfig,
     ConfigError,
     load_config,
+    parse_integer,
 )
 from heictojpg.converter import (
     SUPPORTED_SOURCE_SUFFIXES,
+    ConversionError,
     ConversionResult,
     convert_files,
     is_webp_supported,
@@ -87,7 +90,9 @@ TRANSLATIONS = {
         "optimize": "Optimize",
         "progressive": "Progressive",
         "lossless": "Lossless",
-        "metadata": "Metadata",
+        "resize_enabled": "Resize",
+        "max_dimension": "Long edge (px)",
+        "metadata": "Resize, metadata and finish",
         "keep_exif": "Keep Exif",
         "keep_icc_profile": "Keep ICC profile",
         "remove_gps": "Remove GPS",
@@ -96,6 +101,7 @@ TRANSLATIONS = {
         "ready": "Ready.",
         "files_added": "Added {count} file(s).",
         "no_files": "Add image files before converting.",
+        "no_input_files": "No source images remain after excluding output folders.",
         "converted": "Converted {converted}; skipped {skipped}.",
         "converted_summary": "Converted {converted}; skipped {skipped}; failed {failed}.",
         "cancel": "Cancel",
@@ -110,6 +116,10 @@ TRANSLATIONS = {
         "webp_unavailable_suffix": " unavailable",
         "config_error": "The saved settings could not be loaded:\n{error}",
         "unsupported_paths": "Some items could not be added:\n{items}",
+        "open_folder_error_title": "Could not open output folder",
+        "open_folder_errors": (
+            "Converted files were saved, but some output folders could not be opened:\n{items}"
+        ),
         "policy_rename": "Rename automatically",
         "policy_skip": "Skip existing files",
         "policy_overwrite": "Overwrite existing files",
@@ -142,7 +152,9 @@ TRANSLATIONS = {
         "optimize": "最適化",
         "progressive": "プログレッシブ",
         "lossless": "ロスレス",
-        "metadata": "メタデータ",
+        "resize_enabled": "リサイズ",
+        "max_dimension": "長辺 (px)",
+        "metadata": "リサイズ・メタデータ・完了後",
         "keep_exif": "Exif を保持",
         "keep_icc_profile": "ICC プロファイルを保持",
         "remove_gps": "GPS を削除",
@@ -151,6 +163,7 @@ TRANSLATIONS = {
         "ready": "準備完了。",
         "files_added": "{count} 件追加しました。",
         "no_files": "変換する画像ファイルを追加してください。",
+        "no_input_files": "出力フォルダ内の画像を除くと、変換対象がありません。",
         "converted": "変換 {converted} 件、スキップ {skipped} 件。",
         "converted_summary": "変換 {converted} 件、スキップ {skipped} 件、失敗 {failed} 件。",
         "cancel": "キャンセル",
@@ -165,6 +178,10 @@ TRANSLATIONS = {
         "webp_unavailable_suffix": " 利用不可",
         "config_error": "保存済み設定を読み込めませんでした:\n{error}",
         "unsupported_paths": "追加できない項目がありました:\n{items}",
+        "open_folder_error_title": "出力フォルダを開けませんでした",
+        "open_folder_errors": (
+            "変換済みファイルは保存されましたが、一部の出力フォルダを開けませんでした:\n{items}"
+        ),
         "policy_rename": "自動リネーム",
         "policy_skip": "既存ファイルをスキップ",
         "policy_overwrite": "既存ファイルを上書き",
@@ -183,23 +200,37 @@ def parse_drop_data(data: str) -> list[Path]:
     return [Path(value) for value in Tcl().splitlist(data)]
 
 
-def collect_image_files(paths: list[Path], *, recursive: bool) -> tuple[list[Path], list[str]]:
+def collect_image_files(
+    paths: list[Path],
+    *,
+    recursive: bool,
+    excluded_directory_names: tuple[str, ...] = (),
+    excluded_directories: tuple[Path, ...] = (),
+) -> tuple[list[Path], list[str]]:
     files: list[Path] = []
     errors: list[str] = []
 
     for path in paths:
-        if path.is_file() and path.suffix.lower() in SUPPORTED_SOURCE_SUFFIXES:
-            files.append(path)
-        elif path.is_dir():
-            folder_files = list_source_images(path, recursive=recursive)
-            if folder_files:
-                files.extend(folder_files)
+        try:
+            if path.is_file() and path.suffix.lower() in SUPPORTED_SOURCE_SUFFIXES:
+                files.append(path)
+            elif path.is_dir():
+                folder_files = list_source_images(
+                    path,
+                    recursive=recursive,
+                    excluded_directory_names=excluded_directory_names,
+                    excluded_directories=excluded_directories,
+                )
+                if folder_files:
+                    files.extend(folder_files)
+                else:
+                    errors.append(f"{path}: no supported image files")
+            elif path.exists():
+                errors.append(f"{path}: unsupported source type")
             else:
-                errors.append(f"{path}: no supported image files")
-        elif path.exists():
-            errors.append(f"{path}: unsupported source type")
-        else:
-            errors.append(f"{path}: does not exist")
+                errors.append(f"{path}: does not exist")
+        except (ConversionError, OSError) as exc:
+            errors.append(f"{path}: {exc}")
 
     deduped: list[Path] = []
     seen: set[Path] = set()
@@ -210,6 +241,34 @@ def collect_image_files(paths: list[Path], *, recursive: bool) -> tuple[list[Pat
             deduped.append(file_path)
 
     return deduped, errors
+
+
+def is_output_source(path: Path, source_root: Path | None, settings: AppConfig) -> bool:
+    if source_root is None:
+        return False
+
+    resolved_path = path.resolve()
+    resolved_root = source_root.resolve()
+    try:
+        relative_parent_parts = resolved_path.relative_to(resolved_root).parts[:-1]
+    except ValueError:
+        return False
+
+    if settings.output_mode == OUTPUT_MODE_CONVERTED_SUBFOLDER:
+        return any(part.casefold() == "converted" for part in relative_parent_parts)
+    if (
+        settings.output_mode == OUTPUT_MODE_FIXED_FOLDER
+        and settings.output_dir is not None
+        and _is_strictly_within(settings.output_dir, resolved_root)
+    ):
+        return resolved_path.is_relative_to(settings.output_dir.resolve())
+    return False
+
+
+def _is_strictly_within(path: Path, parent: Path) -> bool:
+    resolved_path = path.resolve()
+    resolved_parent = parent.resolve()
+    return resolved_path != resolved_parent and resolved_path.is_relative_to(resolved_parent)
 
 
 class ConverterWindow:
@@ -233,12 +292,14 @@ class ConverterWindow:
         self.output_format = StringVar(value=self._initial_output_format())
         self.fixed_output_dir = self.config.output_dir
         self.recursive = BooleanVar(value=False)
-        self.jpeg_quality = IntVar(value=self.config.jpeg_quality)
+        self.jpeg_quality = StringVar(value=str(self.config.jpeg_quality))
         self.jpeg_optimize = BooleanVar(value=self.config.jpeg_optimize)
         self.jpeg_progressive = BooleanVar(value=self.config.jpeg_progressive)
-        self.webp_quality = IntVar(value=self.config.webp_quality)
+        self.webp_quality = StringVar(value=str(self.config.webp_quality))
         self.webp_lossless = BooleanVar(value=self.config.webp_lossless)
-        self.png_compress_level = IntVar(value=self.config.png_compress_level)
+        self.png_compress_level = StringVar(value=str(self.config.png_compress_level))
+        self.resize_enabled = BooleanVar(value=self.config.max_dimension is not None)
+        self.max_dimension = StringVar(value=str(self.config.max_dimension or 1920))
         self.keep_exif = BooleanVar(value=self.config.keep_exif)
         self.keep_icc_profile = BooleanVar(value=self.config.keep_icc_profile)
         self.remove_gps = BooleanVar(value=self.config.remove_gps)
@@ -250,20 +311,25 @@ class ConverterWindow:
         self.cancel_event = threading.Event()
 
         self.files: list[Path] = []
+        self.file_source_roots: list[Path | None] = []
         self.widgets: dict[str, ttk.Widget] = {}
 
         self._build()
         self._apply_language()
         self._update_fixed_folder_state()
+        self._update_resize_state()
         self._enable_drop_targets()
         if initial_paths:
             self.add_paths(initial_paths)
         if config_error:
-            self.root.after(100, lambda: messagebox.showwarning(
-                self._t("window_title"),
-                self._t("config_error").format(error=config_error),
-                parent=self.root,
-            ))
+            self.root.after(
+                100,
+                lambda: messagebox.showwarning(
+                    self._t("window_title"),
+                    self._t("config_error").format(error=config_error),
+                    parent=self.root,
+                ),
+            )
 
     def _build(self) -> None:
         frame = ttk.Frame(self.root, padding=16)
@@ -293,7 +359,9 @@ class ConverterWindow:
         list_area.columnconfigure(0, weight=1)
         list_area.rowconfigure(0, weight=1)
 
-        self.file_list = ttk.Treeview(list_area, columns=("path",), show="headings", selectmode="extended")
+        self.file_list = ttk.Treeview(
+            list_area, columns=("path",), show="headings", selectmode="extended"
+        )
         self.file_list.grid(row=0, column=0, sticky="nsew")
         self.file_list.heading("path", text=self._t("files"))
         self.file_list.column("path", width=480, stretch=True)
@@ -317,8 +385,37 @@ class ConverterWindow:
         self.widgets["include_subfolders"] = ttk.Checkbutton(button_row, variable=self.recursive)
         self.widgets["include_subfolders"].grid(row=0, column=5, sticky="e")
 
-        settings = ttk.Frame(content)
-        settings.grid(row=0, column=1, sticky="nsew")
+        settings_container = ttk.Frame(content)
+        settings_container.grid(row=0, column=1, sticky="nsew")
+        settings_container.columnconfigure(0, weight=1)
+        settings_container.rowconfigure(0, weight=1)
+        settings_background = ttk.Style(self.root).lookup("TFrame", "background")
+        settings_canvas = Canvas(
+            settings_container,
+            background=settings_background,
+            borderwidth=0,
+            highlightthickness=0,
+            yscrollincrement=24,
+        )
+        settings_canvas.grid(row=0, column=0, sticky="nsew")
+        settings_scrollbar = ttk.Scrollbar(
+            settings_container,
+            orient="vertical",
+            command=settings_canvas.yview,
+        )
+        settings_scrollbar.grid(row=0, column=1, sticky="ns")
+        settings_canvas.configure(yscrollcommand=settings_scrollbar.set)
+
+        settings = ttk.Frame(settings_canvas)
+        settings_window = settings_canvas.create_window((0, 0), window=settings, anchor="nw")
+        settings.bind(
+            "<Configure>",
+            lambda _event: settings_canvas.configure(scrollregion=settings_canvas.bbox("all")),
+        )
+        settings_canvas.bind(
+            "<Configure>",
+            lambda event: settings_canvas.itemconfigure(settings_window, width=event.width),
+        )
         settings.columnconfigure(0, weight=1)
 
         self._build_format_section(settings).grid(row=0, column=0, sticky="ew")
@@ -326,6 +423,7 @@ class ConverterWindow:
         self._build_output_section(settings).grid(row=2, column=0, sticky="ew", pady=(12, 0))
         self._build_overwrite_section(settings).grid(row=3, column=0, sticky="ew", pady=(12, 0))
         self._build_metadata_section(settings).grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        self._bind_mousewheel(settings, settings_canvas)
 
         bottom = ttk.Frame(frame)
         bottom.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -342,12 +440,26 @@ class ConverterWindow:
         self.widgets["convert"].grid(row=2, column=2, sticky="e", pady=(8, 0))
         self.widgets["cancel"].configure(state="disabled")
 
+    def _bind_mousewheel(self, widget: Misc, canvas: Canvas) -> None:
+        def scroll(event: object) -> str | None:
+            delta = int(getattr(event, "delta", 0))
+            if delta == 0:
+                return None
+            canvas.yview_scroll(-1 if delta > 0 else 1, "units")
+            return "break"
+
+        widget.bind("<MouseWheel>", scroll, add="+")
+        for child in widget.winfo_children():
+            self._bind_mousewheel(child, canvas)
+
     def _build_format_section(self, parent: ttk.Frame) -> ttk.LabelFrame:
         section = ttk.LabelFrame(parent, padding=12)
         self.widgets["format_section"] = section
         self.format_buttons: dict[str, ttk.Radiobutton] = {}
         for column, output_format in enumerate((FORMAT_JPEG, FORMAT_PNG, FORMAT_WEBP)):
-            state = "disabled" if output_format == FORMAT_WEBP and not self.webp_supported else "normal"
+            state = (
+                "disabled" if output_format == FORMAT_WEBP and not self.webp_supported else "normal"
+            )
             button = ttk.Radiobutton(
                 section,
                 value=output_format,
@@ -422,11 +534,13 @@ class ConverterWindow:
             state=state,
         )
         self.widgets["webp_lossless"].grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
         return section
 
     def _build_output_section(self, parent: ttk.Frame) -> ttk.LabelFrame:
         section = ttk.LabelFrame(parent, padding=12)
-        section.columnconfigure(0, weight=1)
+        for column in range(3):
+            section.columnconfigure(column, weight=1)
         self.widgets["output_section"] = section
         self.widgets["same_folder"] = ttk.Radiobutton(
             section,
@@ -434,25 +548,31 @@ class ConverterWindow:
             variable=self.output_mode,
             command=self._update_fixed_folder_state,
         )
-        self.widgets["same_folder"].grid(row=0, column=0, sticky="w")
+        self.widgets["same_folder"].grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.widgets["converted_subfolder"] = ttk.Radiobutton(
             section,
             value=OUTPUT_MODE_CONVERTED_SUBFOLDER,
             variable=self.output_mode,
             command=self._update_fixed_folder_state,
         )
-        self.widgets["converted_subfolder"].grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.widgets["converted_subfolder"].grid(row=0, column=1, sticky="w", padx=(0, 8))
         self.widgets["fixed_folder"] = ttk.Radiobutton(
             section,
             value=OUTPUT_MODE_FIXED_FOLDER,
             variable=self.output_mode,
             command=self._update_fixed_folder_state,
         )
-        self.widgets["fixed_folder"].grid(row=2, column=0, sticky="w", pady=(6, 0))
-        self.widgets["folder_label"] = ttk.Label(section, wraplength=280)
-        self.widgets["folder_label"].grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        self.widgets["fixed_folder"].grid(row=0, column=2, sticky="w")
+        self.widgets["folder_label"] = ttk.Label(section, wraplength=220)
+        self.widgets["folder_label"].grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(8, 0),
+        )
         self.widgets["choose"] = ttk.Button(section, command=self.choose_output_folder)
-        self.widgets["choose"].grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.widgets["choose"].grid(row=1, column=2, sticky="e", padx=(8, 0), pady=(8, 0))
         return section
 
     def _build_overwrite_section(self, parent: ttk.Frame) -> ttk.LabelFrame:
@@ -470,18 +590,49 @@ class ConverterWindow:
 
     def _build_metadata_section(self, parent: ttk.Frame) -> ttk.LabelFrame:
         section = ttk.LabelFrame(parent, padding=12)
+        section.columnconfigure(1, weight=1)
         self.widgets["metadata_section"] = section
+        self.widgets["resize_enabled"] = ttk.Checkbutton(
+            section,
+            variable=self.resize_enabled,
+            command=self._update_resize_state,
+        )
+        self.widgets["resize_enabled"].grid(row=0, column=0, sticky="w")
+        resize_value = ttk.Frame(section)
+        resize_value.grid(row=0, column=1, sticky="w", padx=(16, 0))
+        self.widgets["max_dimension_label"] = ttk.Label(resize_value)
+        self.widgets["max_dimension_label"].grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.widgets["max_dimension_spinbox"] = ttk.Spinbox(
+            resize_value,
+            from_=1,
+            to=100000,
+            width=7,
+            textvariable=self.max_dimension,
+        )
+        self.widgets["max_dimension_spinbox"].grid(row=0, column=1, sticky="w")
         self.widgets["keep_exif"] = ttk.Checkbutton(section, variable=self.keep_exif)
-        self.widgets["keep_exif"].grid(row=0, column=0, sticky="w")
+        self.widgets["keep_exif"].grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.widgets["keep_icc_profile"] = ttk.Checkbutton(section, variable=self.keep_icc_profile)
-        self.widgets["keep_icc_profile"].grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.widgets["keep_icc_profile"].grid(
+            row=1,
+            column=1,
+            sticky="w",
+            padx=(16, 0),
+            pady=(6, 0),
+        )
         self.widgets["remove_gps"] = ttk.Checkbutton(section, variable=self.remove_gps)
         self.widgets["remove_gps"].grid(row=2, column=0, sticky="w", pady=(6, 0))
         self.widgets["open_output_folder"] = ttk.Checkbutton(
             section,
             variable=self.open_output_folder,
         )
-        self.widgets["open_output_folder"].grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self.widgets["open_output_folder"].grid(
+            row=2,
+            column=1,
+            sticky="w",
+            padx=(16, 0),
+            pady=(6, 0),
+        )
         return section
 
     def _enable_drop_targets(self) -> None:
@@ -516,17 +667,41 @@ class ConverterWindow:
             self._update_fixed_folder_state()
 
     def add_paths(self, paths: list[Path]) -> None:
-        files, errors = collect_image_files(paths, recursive=self.recursive.get())
+        output_mode = self.output_mode.get()
+        excluded_directory_names = (
+            ("converted",) if output_mode == OUTPUT_MODE_CONVERTED_SUBFOLDER else ()
+        )
         added = 0
-        current = {path.resolve() for path in self.files}
-        for file_path in files:
-            resolved = file_path.resolve()
-            if resolved in current:
-                continue
-            current.add(resolved)
-            self.files.append(file_path)
-            self.file_list.insert("", "end", values=(str(file_path),))
-            added += 1
+        errors: list[str] = []
+        current = {path.resolve(): index for index, path in enumerate(self.files)}
+        for source_path in paths:
+            source_root = source_path.resolve() if source_path.is_dir() else None
+            excluded_directories = (
+                (self.fixed_output_dir,)
+                if source_root is not None
+                and output_mode == OUTPUT_MODE_FIXED_FOLDER
+                and self.fixed_output_dir is not None
+                and _is_strictly_within(self.fixed_output_dir, source_root)
+                else ()
+            )
+            files, path_errors = collect_image_files(
+                [source_path],
+                recursive=self.recursive.get(),
+                excluded_directory_names=excluded_directory_names,
+                excluded_directories=excluded_directories,
+            )
+            errors.extend(path_errors)
+            for file_path in files:
+                resolved = file_path.resolve()
+                if resolved in current:
+                    if source_root is None:
+                        self.file_source_roots[current[resolved]] = None
+                    continue
+                current[resolved] = len(self.files)
+                self.files.append(file_path)
+                self.file_source_roots.append(source_root)
+                self.file_list.insert("", "end", values=(str(file_path),))
+                added += 1
 
         if added:
             self.status.set(self._t("files_added").format(count=added))
@@ -546,9 +721,11 @@ class ConverterWindow:
             self.file_list.delete(item)
         for index in selected_indexes:
             del self.files[index]
+            del self.file_source_roots[index]
 
     def clear_files(self) -> None:
         self.files.clear()
+        self.file_source_roots.clear()
         for item in self.file_list.get_children():
             self.file_list.delete(item)
         self.status.set(self._t("ready"))
@@ -573,7 +750,18 @@ class ConverterWindow:
             messagebox.showerror(self._t("window_title"), str(exc), parent=self.root)
             return
 
-        files = list(self.files)
+        files = [
+            file_path
+            for file_path, source_root in zip(self.files, self.file_source_roots, strict=True)
+            if not is_output_source(file_path, source_root, config)
+        ]
+        if not files:
+            messagebox.showinfo(
+                self._t("window_title"),
+                self._t("no_input_files"),
+                parent=self.root,
+            )
+            return
         self.cancel_event.clear()
         self.progress.configure(maximum=len(files), value=0)
         self.current_file.set(self._t("no_current_file"))
@@ -595,18 +783,24 @@ class ConverterWindow:
             for index, file_path in enumerate(files, start=1):
                 if self.cancel_event.is_set():
                     break
-                self.root.after(0, lambda index=index, file_path=file_path: self._handle_progress(
-                    index - 1,
-                    total,
-                    file_path,
-                ))
+                self.root.after(
+                    0,
+                    lambda index=index, file_path=file_path: self._handle_progress(
+                        index - 1,
+                        total,
+                        file_path,
+                    ),
+                )
                 result = convert_files([file_path], settings=config)[0]
                 results.append(result)
-                self.root.after(0, lambda index=index, file_path=file_path: self._handle_progress(
-                    index,
-                    total,
-                    file_path,
-                ))
+                self.root.after(
+                    0,
+                    lambda index=index, file_path=file_path: self._handle_progress(
+                        index,
+                        total,
+                        file_path,
+                    ),
+                )
         except (ConfigError, OSError) as exc:
             message = str(exc)
             self.root.after(0, lambda: self._handle_conversion_error(message))
@@ -639,9 +833,7 @@ class ConverterWindow:
         skipped = sum(1 for result in results if result.status == "skipped")
         failed = sum(1 for result in results if result.status == "failed")
         key = "cancelled" if cancelled else "converted_summary"
-        self.status.set(
-            self._t(key).format(converted=converted, skipped=skipped, failed=failed)
-        )
+        self.status.set(self._t(key).format(converted=converted, skipped=skipped, failed=failed))
         if failed:
             self._show_failed_results(results)
         if config.open_output_folder:
@@ -663,12 +855,20 @@ class ConverterWindow:
             output_dir=self.fixed_output_dir if output_mode == OUTPUT_MODE_FIXED_FOLDER else None,
             output_format=self.output_format.get(),
             overwrite_policy=self.overwrite_policy,
-            jpeg_quality=self.jpeg_quality.get(),
+            jpeg_quality=parse_integer(self.jpeg_quality.get(), "JPEG quality"),
             jpeg_optimize=self.jpeg_optimize.get(),
             jpeg_progressive=self.jpeg_progressive.get(),
-            webp_quality=self.webp_quality.get(),
+            webp_quality=parse_integer(self.webp_quality.get(), "WebP quality"),
             webp_lossless=self.webp_lossless.get(),
-            png_compress_level=self.png_compress_level.get(),
+            png_compress_level=parse_integer(
+                self.png_compress_level.get(),
+                "PNG compress level",
+            ),
+            max_dimension=(
+                parse_integer(self.max_dimension.get(), "Maximum dimension")
+                if self.resize_enabled.get()
+                else None
+            ),
             keep_exif=self.keep_exif.get(),
             keep_icc_profile=self.keep_icc_profile.get(),
             remove_gps=self.remove_gps.get(),
@@ -712,6 +912,8 @@ class ConverterWindow:
             "webp_heading": "webp",
             "webp_quality_label": "quality",
             "webp_lossless": "lossless",
+            "resize_enabled": "resize_enabled",
+            "max_dimension_label": "max_dimension",
             "keep_exif": "keep_exif",
             "keep_icc_profile": "keep_icc_profile",
             "remove_gps": "remove_gps",
@@ -738,6 +940,7 @@ class ConverterWindow:
         self.overwrite_combo.configure(values=list(policy_labels.values()))
         self.overwrite_policy_label.set(policy_labels[self.overwrite_policy])
         self._update_fixed_folder_state()
+        self._update_resize_state()
         if not self._busy:
             self.current_file.set(self._t("no_current_file"))
             self.status.set(self._t("ready"))
@@ -748,29 +951,39 @@ class ConverterWindow:
         label = str(self.fixed_output_dir) if self.fixed_output_dir else self._t("no_fixed_folder")
         self.widgets["folder_label"].configure(text=label)
 
+    def _update_resize_state(self) -> None:
+        state = "normal" if self.resize_enabled.get() else "disabled"
+        self.widgets["max_dimension_label"].configure(state=state)
+        self.widgets["max_dimension_spinbox"].configure(state=state)
+
     def _policy_labels(self) -> dict[str, str]:
-        return {
-            value: self._t(POLICY_LABEL_KEYS[value])
-            for value in POLICY_VALUES
-        }
+        return {value: self._t(POLICY_LABEL_KEYS[value]) for value in POLICY_VALUES}
 
     def _policy_values_by_label(self) -> dict[str, str]:
-        return {
-            label: value
-            for value, label in self._policy_labels().items()
-        }
+        return {label: value for value, label in self._policy_labels().items()}
 
     def _open_result_folders(self, results: list[ConversionResult]) -> None:
         folders = sorted(
             {str(result.target.parent) for result in results if result.status != "failed"}
         )
+        errors: list[str] = []
         for folder in folders:
-            if sys.platform == "win32":
-                os.startfile(folder)  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", folder])
-            else:
-                subprocess.Popen(["xdg-open", folder])
+            try:
+                if sys.platform == "win32":
+                    os.startfile(folder)  # type: ignore[attr-defined]
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", folder])
+                else:
+                    subprocess.Popen(["xdg-open", folder])
+            except OSError as exc:
+                errors.append(f"{folder}: {exc}")
+
+        if errors:
+            messagebox.showwarning(
+                self._t("open_folder_error_title"),
+                self._t("open_folder_errors").format(items="\n".join(errors)),
+                parent=self.root,
+            )
 
     def _t(self, key: str) -> str:
         return TRANSLATIONS[self.language][key]

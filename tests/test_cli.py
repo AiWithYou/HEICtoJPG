@@ -7,6 +7,7 @@ from PIL import Image
 
 from heictojpg import cli
 from heictojpg.cli import main
+from heictojpg.config import AppConfig, save_config
 
 
 def test_cli_convert_png(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -30,6 +31,43 @@ def test_cli_convert_png(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert exit_code == 0
     assert (output_dir / "sample.png").exists()
+
+
+def test_cli_max_dimension_overrides_saved_setting_and_no_resize_disables_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_config(tmp_path, monkeypatch)
+    save_config(AppConfig(max_dimension=6))
+    resized_source = tmp_path / "resized.png"
+    original_size_source = tmp_path / "original-size.png"
+    _write_sample_png(resized_source)
+    _write_sample_png(original_size_source)
+
+    resized_exit_code = main(
+        [
+            "--no-dialog",
+            "convert",
+            str(resized_source),
+            "--max-dimension",
+            "4",
+        ]
+    )
+    original_size_exit_code = main(
+        [
+            "--no-dialog",
+            "convert",
+            str(original_size_source),
+            "--no-resize",
+        ]
+    )
+
+    assert resized_exit_code == 0
+    assert original_size_exit_code == 0
+    with Image.open(tmp_path / "resized.jpg") as image:
+        assert image.size == (4, 3)
+    with Image.open(tmp_path / "original-size.jpg") as image:
+        assert image.size == (8, 6)
 
 
 def test_cli_context_convert_starts_detached_worker(
@@ -140,6 +178,36 @@ def test_cli_convert_can_remove_icc_profile(
     assert exit_code == 0
     with Image.open(tmp_path / "sample_1.png") as image:
         assert "icc_profile" not in image.info
+
+
+def test_cli_reports_output_folder_open_failure_after_successful_conversion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _isolate_config(tmp_path, monkeypatch)
+    source = tmp_path / "sample.png"
+    _write_sample_png(source)
+
+    def fail_open_folder(_folder: str) -> None:
+        raise OSError("simulated shell failure")
+
+    monkeypatch.setattr(cli, "_open_folder", fail_open_folder)
+
+    exit_code = main(
+        [
+            "--no-dialog",
+            "convert",
+            str(source),
+            "--open-output-folder",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert (tmp_path / "sample.jpg").exists()
+    assert "Could not open output folder" in captured.err
+    assert "simulated shell failure" in captured.err
 
 
 def _isolate_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

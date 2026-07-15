@@ -135,6 +135,17 @@ def _add_conversion_options(parser: argparse.ArgumentParser) -> None:
         type=int,
         help="PNG compression level from 0 to 9.",
     )
+    resize_group = parser.add_mutually_exclusive_group()
+    resize_group.add_argument(
+        "--max-dimension",
+        type=int,
+        help="Shrink images so their longest edge is at most this many pixels.",
+    )
+    resize_group.add_argument(
+        "--no-resize",
+        action="store_true",
+        help="Disable resizing from saved settings for this conversion.",
+    )
     parser.add_argument(
         "--overwrite-policy",
         choices=OVERWRITE_POLICIES,
@@ -175,18 +186,20 @@ def _run_convert(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
     results = convert_files(args.files, settings=config)
     _print_results(results)
-    if config.open_output_folder:
-        _open_result_folders(results)
-    return _exit_code_for_results(results)
+    exit_code = _exit_code_for_results(results)
+    if config.open_output_folder and not _open_result_folders(results):
+        exit_code = 1
+    return exit_code
 
 
 def _run_convert_folder(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
     results = convert_folder(args.folder, recursive=args.recursive, settings=config)
     _print_results(results)
-    if config.open_output_folder:
-        _open_result_folders(results)
-    return _exit_code_for_results(results)
+    exit_code = _exit_code_for_results(results)
+    if config.open_output_folder and not _open_result_folders(results):
+        exit_code = 1
+    return exit_code
 
 
 def _run_context_convert(args: argparse.Namespace) -> int:
@@ -254,6 +267,10 @@ def _config_from_args(args: argparse.Namespace) -> AppConfig:
         changes["webp_lossless"] = args.webp_lossless
     if args.png_compress_level is not None:
         changes["png_compress_level"] = args.png_compress_level
+    if args.no_resize:
+        changes["max_dimension"] = None
+    elif args.max_dimension is not None:
+        changes["max_dimension"] = args.max_dimension
     if args.overwrite_policy is not None:
         changes["overwrite_policy"] = args.overwrite_policy
     if args.overwrite:
@@ -297,13 +314,15 @@ def _exit_code_for_results(results: list[object]) -> int:
 
 
 def _result_counts(results: list[object]) -> tuple[int, int, int]:
-    converted = sum(1 for result in results if getattr(result, "status", "converted") == "converted")
+    converted = sum(
+        1 for result in results if getattr(result, "status", "converted") == "converted"
+    )
     skipped = sum(1 for result in results if getattr(result, "status", "converted") == "skipped")
     failed = sum(1 for result in results if getattr(result, "status", "converted") == "failed")
     return converted, skipped, failed
 
 
-def _open_result_folders(results: list[object]) -> None:
+def _open_result_folders(results: list[object]) -> bool:
     folders = sorted(
         {
             str(getattr(result, "target").parent)
@@ -311,8 +330,14 @@ def _open_result_folders(results: list[object]) -> None:
             if getattr(result, "status", "converted") != "failed"
         }
     )
+    opened_all = True
     for folder in folders:
-        _open_folder(folder)
+        try:
+            _open_folder(folder)
+        except OSError as exc:
+            _write_error(f"Could not open output folder '{folder}': {exc}")
+            opened_all = False
+    return opened_all
 
 
 def _open_folder(folder: str) -> None:

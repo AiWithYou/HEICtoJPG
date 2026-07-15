@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from tkinter import BooleanVar, IntVar, StringVar, Tk, filedialog, messagebox, ttk
+from tkinter import BooleanVar, Canvas, Misc, StringVar, Tk, filedialog, messagebox, ttk
 
 from heictojpg.config import (
     APP_NAME,
@@ -20,6 +20,7 @@ from heictojpg.config import (
     AppConfig,
     ConfigError,
     load_config,
+    parse_integer,
     save_config,
 )
 from heictojpg.converter import is_webp_supported
@@ -61,13 +62,15 @@ TRANSLATIONS = {
         "optimize": "Optimize",
         "progressive": "Progressive",
         "lossless": "Lossless",
+        "resize_enabled": "Resize",
+        "max_dimension": "Long edge (px)",
         "policy_section": "Existing file behavior",
         "when_output_exists": "When output exists",
         "policy_rename": "Rename automatically",
         "policy_skip": "Skip existing files",
         "policy_overwrite": "Overwrite existing files",
         "policy_error": "Show an error",
-        "metadata_section": "Metadata and finish",
+        "metadata_section": "Resize, metadata and finish",
         "keep_exif": "Keep Exif",
         "keep_icc_profile": "Keep ICC profile",
         "remove_gps": "Remove GPS",
@@ -108,13 +111,15 @@ TRANSLATIONS = {
         "optimize": "最適化",
         "progressive": "プログレッシブ",
         "lossless": "ロスレス",
+        "resize_enabled": "リサイズ",
+        "max_dimension": "長辺 (px)",
         "policy_section": "同名ファイル時の挙動",
         "when_output_exists": "出力ファイルが存在する場合",
         "policy_rename": "自動リネーム",
         "policy_skip": "既存ファイルをスキップ",
         "policy_overwrite": "既存ファイルを上書き",
         "policy_error": "エラーを表示",
-        "metadata_section": "メタデータと完了後の動作",
+        "metadata_section": "リサイズ・メタデータ・完了後の動作",
         "keep_exif": "Exif を保持",
         "keep_icc_profile": "ICC プロファイルを保持",
         "remove_gps": "GPS を削除",
@@ -152,8 +157,9 @@ FORMAT_LABELS = {
 class SettingsWindow:
     def __init__(self, root: Tk) -> None:
         self.root = root
-        self.root.geometry("680x840")
-        self.root.minsize(640, 800)
+        window_height = min(840, max(480, self.root.winfo_screenheight() - 96))
+        self.root.geometry(f"680x{window_height}")
+        self.root.minsize(640, 480)
         self.webp_supported = is_webp_supported()
 
         config_error = None
@@ -168,12 +174,14 @@ class SettingsWindow:
         self.output_mode = StringVar(value=self.config.output_mode)
         self.fixed_output_dir = self.config.output_dir
         self.output_format = StringVar(value=self._initial_output_format())
-        self.jpeg_quality = IntVar(value=self.config.jpeg_quality)
+        self.jpeg_quality = StringVar(value=str(self.config.jpeg_quality))
         self.jpeg_optimize = BooleanVar(value=self.config.jpeg_optimize)
         self.jpeg_progressive = BooleanVar(value=self.config.jpeg_progressive)
-        self.webp_quality = IntVar(value=self.config.webp_quality)
+        self.webp_quality = StringVar(value=str(self.config.webp_quality))
         self.webp_lossless = BooleanVar(value=self.config.webp_lossless)
-        self.png_compress_level = IntVar(value=self.config.png_compress_level)
+        self.png_compress_level = StringVar(value=str(self.config.png_compress_level))
+        self.resize_enabled = BooleanVar(value=self.config.max_dimension is not None)
+        self.max_dimension = StringVar(value=str(self.config.max_dimension or 1920))
         self.overwrite_policy = self.config.overwrite_policy
         self.overwrite_policy_label = StringVar()
         self.keep_exif = BooleanVar(value=self.config.keep_exif)
@@ -187,6 +195,7 @@ class SettingsWindow:
         self._build()
         self._apply_language()
         self._update_fixed_folder_state()
+        self._update_resize_state()
         if config_error:
             self.root.after(100, lambda: self._show_config_error(config_error))
         if self.config.output_format == FORMAT_WEBP and not self.webp_supported:
@@ -198,14 +207,64 @@ class SettingsWindow:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
 
-        self._build_language_section(frame).grid(row=0, column=0, sticky="ew")
-        self._build_output_section(frame).grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        self._build_format_section(frame).grid(row=2, column=0, sticky="ew", pady=(12, 0))
-        self._build_quality_section(frame).grid(row=3, column=0, sticky="ew", pady=(12, 0))
-        self._build_policy_section(frame).grid(row=4, column=0, sticky="ew", pady=(12, 0))
-        self._build_metadata_section(frame).grid(row=5, column=0, sticky="ew", pady=(12, 0))
-        self._build_button_row(frame).grid(row=6, column=0, sticky="ew", pady=(16, 0))
+        settings_background = ttk.Style(self.root).lookup("TFrame", "background")
+        settings_canvas = Canvas(
+            frame,
+            background=settings_background,
+            borderwidth=0,
+            highlightthickness=0,
+            yscrollincrement=24,
+        )
+        settings_canvas.grid(row=0, column=0, sticky="nsew")
+        settings_scrollbar = ttk.Scrollbar(
+            frame,
+            orient="vertical",
+            command=settings_canvas.yview,
+        )
+        settings_scrollbar.grid(row=0, column=1, sticky="ns")
+        settings_canvas.configure(yscrollcommand=settings_scrollbar.set)
+
+        settings = ttk.Frame(settings_canvas)
+        settings.columnconfigure(0, weight=1)
+        settings_window = settings_canvas.create_window((0, 0), window=settings, anchor="nw")
+        settings.bind(
+            "<Configure>",
+            lambda _event: settings_canvas.configure(scrollregion=settings_canvas.bbox("all")),
+        )
+        settings_canvas.bind(
+            "<Configure>",
+            lambda event: settings_canvas.itemconfigure(settings_window, width=event.width),
+        )
+
+        self._build_language_section(settings).grid(row=0, column=0, sticky="ew")
+        self._build_output_section(settings).grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        self._build_format_section(settings).grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        self._build_quality_section(settings).grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        self._build_policy_section(settings).grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        self._build_metadata_section(settings).grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        self._bind_mousewheel(settings, settings_canvas)
+
+        self._build_button_row(frame).grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(16, 0),
+        )
+
+    def _bind_mousewheel(self, widget: Misc, canvas: Canvas) -> None:
+        def scroll(event: object) -> str | None:
+            delta = int(getattr(event, "delta", 0))
+            if delta == 0:
+                return None
+            canvas.yview_scroll(-1 if delta > 0 else 1, "units")
+            return "break"
+
+        widget.bind("<MouseWheel>", scroll, add="+")
+        for child in widget.winfo_children():
+            self._bind_mousewheel(child, canvas)
 
     def _build_language_section(self, parent: ttk.Frame) -> ttk.LabelFrame:
         section = ttk.LabelFrame(parent, padding=12)
@@ -272,7 +331,9 @@ class SettingsWindow:
         self.sections["format"] = section
         self.format_buttons: dict[str, ttk.Radiobutton] = {}
         for index, output_format in enumerate((FORMAT_JPEG, FORMAT_PNG, FORMAT_WEBP)):
-            state = "disabled" if output_format == FORMAT_WEBP and not self.webp_supported else "normal"
+            state = (
+                "disabled" if output_format == FORMAT_WEBP and not self.webp_supported else "normal"
+            )
             button = ttk.Radiobutton(
                 section,
                 value=output_format,
@@ -336,6 +397,7 @@ class SettingsWindow:
             state=state,
         )
         self.widgets["webp_lossless"].grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
         return section
 
     def _build_policy_section(self, parent: ttk.Frame) -> ttk.LabelFrame:
@@ -356,18 +418,56 @@ class SettingsWindow:
 
     def _build_metadata_section(self, parent: ttk.Frame) -> ttk.LabelFrame:
         section = ttk.LabelFrame(parent, padding=12)
+        section.columnconfigure(1, weight=1)
+        section.columnconfigure(2, weight=1)
         self.sections["metadata"] = section
+        self.widgets["resize_enabled"] = ttk.Checkbutton(
+            section,
+            variable=self.resize_enabled,
+            command=self._update_resize_state,
+        )
+        self.widgets["resize_enabled"].grid(row=0, column=0, sticky="w")
+        resize_value = ttk.Frame(section)
+        resize_value.grid(row=0, column=1, columnspan=2, sticky="w", padx=(18, 0))
+        self.widgets["max_dimension_label"] = ttk.Label(resize_value)
+        self.widgets["max_dimension_label"].grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.widgets["max_dimension_spinbox"] = ttk.Spinbox(
+            resize_value,
+            from_=1,
+            to=100000,
+            width=7,
+            textvariable=self.max_dimension,
+        )
+        self.widgets["max_dimension_spinbox"].grid(row=0, column=1, sticky="w")
         self.widgets["keep_exif"] = ttk.Checkbutton(section, variable=self.keep_exif)
-        self.widgets["keep_exif"].grid(row=0, column=0, sticky="w", padx=(0, 18))
+        self.widgets["keep_exif"].grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.widgets["keep_icc_profile"] = ttk.Checkbutton(section, variable=self.keep_icc_profile)
-        self.widgets["keep_icc_profile"].grid(row=0, column=1, sticky="w", padx=(0, 18))
+        self.widgets["keep_icc_profile"].grid(
+            row=1,
+            column=1,
+            sticky="w",
+            padx=(18, 0),
+            pady=(6, 0),
+        )
         self.widgets["remove_gps"] = ttk.Checkbutton(section, variable=self.remove_gps)
-        self.widgets["remove_gps"].grid(row=0, column=2, sticky="w", padx=(0, 18))
+        self.widgets["remove_gps"].grid(
+            row=1,
+            column=2,
+            sticky="w",
+            padx=(18, 0),
+            pady=(6, 0),
+        )
         self.widgets["open_output_folder"] = ttk.Checkbutton(
             section,
             variable=self.open_output_folder,
         )
-        self.widgets["open_output_folder"].grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.widgets["open_output_folder"].grid(
+            row=2,
+            column=0,
+            columnspan=3,
+            sticky="w",
+            pady=(6, 0),
+        )
         return section
 
     def _build_button_row(self, parent: ttk.Frame) -> ttk.Frame:
@@ -415,12 +515,20 @@ class SettingsWindow:
             output_mode=output_mode,
             output_dir=self.fixed_output_dir if output_mode == OUTPUT_MODE_FIXED_FOLDER else None,
             output_format=self.output_format.get(),
-            jpeg_quality=self.jpeg_quality.get(),
+            jpeg_quality=parse_integer(self.jpeg_quality.get(), "JPEG quality"),
             jpeg_optimize=self.jpeg_optimize.get(),
             jpeg_progressive=self.jpeg_progressive.get(),
-            webp_quality=self.webp_quality.get(),
+            webp_quality=parse_integer(self.webp_quality.get(), "WebP quality"),
             webp_lossless=self.webp_lossless.get(),
-            png_compress_level=self.png_compress_level.get(),
+            png_compress_level=parse_integer(
+                self.png_compress_level.get(),
+                "PNG compress level",
+            ),
+            max_dimension=(
+                parse_integer(self.max_dimension.get(), "Maximum dimension")
+                if self.resize_enabled.get()
+                else None
+            ),
             overwrite_policy=self.overwrite_policy,
             keep_exif=self.keep_exif.get(),
             keep_icc_profile=self.keep_icc_profile.get(),
@@ -442,6 +550,11 @@ class SettingsWindow:
     def _update_fixed_folder_state(self) -> None:
         state = "normal" if self.output_mode.get() == OUTPUT_MODE_FIXED_FOLDER else "disabled"
         self.choose_button.configure(state=state)
+
+    def _update_resize_state(self) -> None:
+        state = "normal" if self.resize_enabled.get() else "disabled"
+        self.widgets["max_dimension_label"].configure(state=state)
+        self.widgets["max_dimension_spinbox"].configure(state=state)
 
     def _on_language_selected(self, _event: object | None = None) -> None:
         self.language = LANGUAGE_LABELS[self.language_label.get()]
@@ -476,6 +589,8 @@ class SettingsWindow:
             "webp_heading": "webp",
             "webp_quality_label": "quality",
             "webp_lossless": "lossless",
+            "resize_enabled": "resize_enabled",
+            "max_dimension_label": "max_dimension",
             "when_output_exists": "when_output_exists",
             "keep_exif": "keep_exif",
             "keep_icc_profile": "keep_icc_profile",
@@ -497,18 +612,13 @@ class SettingsWindow:
         self.overwrite_combo.configure(values=list(policy_labels.values()))
         self.overwrite_policy_label.set(policy_labels[self.overwrite_policy])
         self.current_folder_value.configure(text=self._folder_label())
+        self._update_resize_state()
 
     def _policy_labels(self) -> dict[str, str]:
-        return {
-            value: self._t(key)
-            for value, key in POLICY_KEYS.items()
-        }
+        return {value: self._t(key) for value, key in POLICY_KEYS.items()}
 
     def _policy_values_by_label(self) -> dict[str, str]:
-        return {
-            label: value
-            for value, label in self._policy_labels().items()
-        }
+        return {label: value for value, label in self._policy_labels().items()}
 
     def _t(self, key: str) -> str:
         return TRANSLATIONS[self.language][key]

@@ -79,6 +79,7 @@ def check_images(folder: Path, output_format: str) -> None:
     for stem, size in [("photo", (16, 8)), ("transparent image", (8, 16))]:
         with Image.open(folder / f"{stem}.{extension}") as image:
             image.load()
+            assert image.format == output_format.upper(), image.format
             assert image.size == size, (image.size, size)
             assert not image.getexif(), "Stripped EXIF reappeared in packaged output"
             assert not image.info.get("icc_profile"), "Stripped ICC reappeared"
@@ -111,7 +112,7 @@ def verify_case(exe: Path, work: Path, reports: Path, language: str, fmt: str) -
     root = TkinterDnD.Tk()
     try:
         window = ConverterWindow(root, initial_paths=inputs)
-        root.geometry("1020x760+30+30")
+        root.geometry("900x680+0+0")
         root.update()
         button = window.widgets["convert"]
         point = (
@@ -136,14 +137,21 @@ def verify_case(exe: Path, work: Path, reports: Path, language: str, fmt: str) -
         left, top, right, bottom = win32gui.GetWindowRect(hwnd)
         _, _, width, height = win32gui.GetClientRect(hwnd)
         wrapper.move_window(
-            x=30,
-            y=30,
+            x=0,
+            y=0,
             width=client_size[0] + right - left - width,
             height=client_size[1] + bottom - top - height,
         )
         wrapper.set_focus()
         time.sleep(0.3)
-        mouse.click(coords=win32gui.ClientToScreen(hwnd, point))
+        click_point = win32gui.ClientToScreen(hwnd, point)
+        print(f"Clicking Convert at {click_point}; client size {client_size}", flush=True)
+        wrapper.capture_as_image().save(reports / f"exe-ready-{language}-{fmt}.png")
+        hit = win32gui.WindowFromPoint(click_point)
+        while hit and hit != hwnd:
+            hit = win32gui.GetParent(hit)
+        assert hit == hwnd, "Convert button is obscured or outside the test desktop"
+        mouse.click(coords=click_point)
         extension = {"jpeg": "jpg", "png": "png", "webp": "webp"}[fmt]
         wait_for(lambda: len(list(exe_out.glob(f"*.{extension}"))) == len(inputs))
         check_images(exe_out, fmt)
@@ -177,6 +185,7 @@ def verify_cancel(work: Path, reports: Path) -> dict:
     root = TkinterDnD.Tk()
     try:
         window = ConverterWindow(root, initial_paths=inputs)
+        root.geometry("900x680+0+0")
 
         def start_and_cancel() -> None:
             window.widgets["convert"].invoke()

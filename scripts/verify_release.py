@@ -7,13 +7,13 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 
 import win32gui
 from PIL import Image, ImageGrab
-from pywinauto import Desktop, mouse
 from tkinterdnd2 import TkinterDnD
 
 from heictojpg.app_gui import ConverterWindow
@@ -91,6 +91,8 @@ def check_images(folder: Path, output_format: str) -> None:
 
 
 def verify_case(exe: Path, work: Path, reports: Path, language: str, fmt: str) -> dict:
+    from pywinauto import Desktop, mouse
+
     case = work / f"{language}-{fmt}"
     inputs = make_inputs(case / "入力 images")
     source_out, exe_out = case / "source-output", case / "exe-output"
@@ -197,6 +199,8 @@ def verify_cancel(work: Path, reports: Path) -> dict:
 
 
 def main() -> None:
+    # TkDnD uses OLE on the GUI thread. Select STA before importing pywinauto.
+    sys.coinit_flags = 2
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exe", type=Path, required=True)
     parser.add_argument("--report-dir", type=Path, required=True)

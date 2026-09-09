@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -105,8 +106,9 @@ def test_config_rejects_unknown_language() -> None:
 
 def test_config_rejects_missing_fixed_output_dir(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
+    missing_dir = tmp_path / "missing"
     config_path.write_text(
-        '{"output_mode": "fixed_folder", "output_dir": "C:/path/that/does/not/exist"}',
+        json.dumps({"output_mode": "fixed_folder", "output_dir": str(missing_dir)}),
         encoding="utf-8",
     )
 

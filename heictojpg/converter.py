@@ -3,9 +3,9 @@ from __future__ import annotations
 import ctypes
 import os
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError, features
 from pillow_heif import register_heif_opener
@@ -25,7 +25,6 @@ from heictojpg.config import (
     AppConfig,
     validate_config,
 )
-
 
 SUPPORTED_SOURCE_SUFFIXES = {
     ".apng",
@@ -131,7 +130,7 @@ def convert_files(
             results.append(_failed_result(source_path, active_settings, str(exc)))
         except (MemoryError, RecursionError):
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - isolate third-party decoder failures per file.
             error = str(exc) or type(exc).__name__
             results.append(_failed_result(source_path, active_settings, error))
     return results
@@ -238,10 +237,8 @@ def _convert_file_with_settings(source_path: Path, settings: AppConfig) -> Conve
 
     target_dir = _target_dir_for_source(source_path, settings)
     extension = FORMAT_EXTENSIONS[settings.output_format]
-    target_path = _target_path_for_policy(
-        target_dir / f"{source_path.stem}{extension}",
-        settings.overwrite_policy,
-    )
+    target_candidate = target_dir / f"{source_path.stem}{extension}"
+    target_path = _target_path_for_policy(target_candidate, settings.overwrite_policy)
     if target_path is None:
         return ConversionResult(
             source=source_path,
@@ -255,8 +252,6 @@ def _convert_file_with_settings(source_path: Path, settings: AppConfig) -> Conve
             normalized = ImageOps.exif_transpose(image)
             resized = _resize_image(normalized, settings.max_dimension)
             output_image = _image_for_format(resized, settings.output_format)
-            if not settings.keep_icc_profile:
-                output_image = _remove_icc_profile(output_image)
             save_kwargs = _save_kwargs(output_image, settings)
             exif = _exif_bytes(
                 resized,
@@ -264,15 +259,17 @@ def _convert_file_with_settings(source_path: Path, settings: AppConfig) -> Conve
                 remove_gps=settings.remove_gps,
                 output_size=output_image.size,
             )
-            if exif:
-                save_kwargs["exif"] = exif
+            # PNG falls back to image.info["exif"] when the keyword is omitted.
+            # An explicit empty value also prevents GPS-only EXIF from returning
+            # after the last tag has been removed.
+            save_kwargs["exif"] = exif or b""
             icc_profile = _icc_profile_bytes(
                 image,
                 normalized,
                 keep_icc_profile=settings.keep_icc_profile,
             )
-            if icc_profile:
-                save_kwargs["icc_profile"] = icc_profile
+            # Override inherited ICC data without copying the entire pixel buffer.
+            save_kwargs["icc_profile"] = icc_profile or b""
     except UnidentifiedImageError as exc:
         raise ConversionError(f"Source file is not a readable image: {source_path}") from exc
     except (Image.DecompressionBombError, SyntaxError, ValueError) as exc:
@@ -283,13 +280,21 @@ def _convert_file_with_settings(source_path: Path, settings: AppConfig) -> Conve
         raise ConversionError(f"Failed to read or transform image '{source_path}': {exc}") from exc
 
     try:
-        _save_image_atomically(output_image, target_path, save_kwargs)
+        published_path = _save_image_atomically(
+            output_image,
+            target_path,
+            save_kwargs,
+            overwrite_policy=settings.overwrite_policy,
+            rename_base=target_candidate,
+        )
     except (OSError, SyntaxError, ValueError) as exc:
         raise ConversionError(
             f"Failed to encode or save image '{source_path}' to '{target_path}': {exc}"
         ) from exc
 
-    return ConversionResult(source=source_path, target=target_path)
+    if published_path is None:
+        return ConversionResult(source=source_path, target=target_candidate, status="skipped")
+    return ConversionResult(source=source_path, target=published_path)
 
 
 def _failed_result(source_path: Path, settings: AppConfig, error: str) -> ConversionResult:
@@ -337,7 +342,7 @@ def _target_dir_for_source(source_path: Path, settings: AppConfig) -> Path:
 
 
 def _target_path_for_policy(target_path: Path, overwrite_policy: str) -> Path | None:
-    if not target_path.exists():
+    if not os.path.lexists(target_path):
         return target_path
     if overwrite_policy == OVERWRITE_ERROR:
         raise ConversionError(f"Target file already exists: {target_path}")
@@ -354,7 +359,7 @@ def _renamed_path(target_path: Path) -> Path:
     counter = 1
     while True:
         candidate = target_path.with_name(f"{target_path.stem}_{counter}{target_path.suffix}")
-        if not candidate.exists():
+        if not os.path.lexists(candidate):
             return candidate
         counter += 1
 
@@ -367,6 +372,9 @@ def _image_for_format(image: Image.Image, output_format: str) -> Image.Image:
             return image
         return image.convert("RGBA")
     if output_format == FORMAT_WEBP:
+        # PNG may encode transparency as a color key rather than an alpha band.
+        if _has_alpha(image) and image.mode != "RGBA":
+            return image.convert("RGBA")
         if image.mode in {"RGB", "RGBA"}:
             return image
         return image.convert("RGBA" if _has_alpha(image) else "RGB")
@@ -404,14 +412,6 @@ def _has_alpha(image: Image.Image) -> bool:
     return "A" in image.getbands() or "transparency" in image.info
 
 
-def _remove_icc_profile(image: Image.Image) -> Image.Image:
-    if "icc_profile" not in image.info:
-        return image
-    image_without_profile = image.copy()
-    image_without_profile.info.pop("icc_profile", None)
-    return image_without_profile
-
-
 def _save_kwargs(image: Image.Image, settings: AppConfig) -> dict[str, object]:
     kwargs: dict[str, object] = {"format": PIL_FORMATS[settings.output_format]}
     if settings.output_format == FORMAT_JPEG:
@@ -434,23 +434,62 @@ def _save_image_atomically(
     image: Image.Image,
     target_path: Path,
     save_kwargs: dict[str, object],
-) -> None:
+    *,
+    overwrite_policy: str = OVERWRITE_OVERWRITE,
+    rename_base: Path | None = None,
+) -> Path | None:
+    """Encode once, then publish without violating the selected collision policy."""
     temp_path, descriptor = _temporary_output_file(target_path)
     try:
         with os.fdopen(descriptor, "w+b") as temp_file:
             _set_hidden_attribute(temp_path)
             image.save(temp_file, **save_kwargs)
-        temp_path.replace(target_path)
-        _clear_hidden_attribute(target_path)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        # Finish attribute changes before publishing. Failure must leave any
+        # existing target untouched, not replace it and then report failure.
+        _clear_hidden_attribute(temp_path)
+        return _publish_output(temp_path, target_path, overwrite_policy, rename_base or target_path)
     finally:
-        if temp_path.exists():
-            temp_path.unlink()
+        temp_path.unlink(missing_ok=True)
+
+
+def _publish_output(
+    temp_path: Path,
+    target_path: Path,
+    overwrite_policy: str,
+    rename_base: Path,
+) -> Path | None:
+    if overwrite_policy == OVERWRITE_OVERWRITE:
+        temp_path.replace(target_path)
+        return target_path
+    if overwrite_policy not in {OVERWRITE_RENAME, OVERWRITE_SKIP, OVERWRITE_ERROR}:
+        raise ConversionError(f"Unsupported overwrite policy: {overwrite_policy}")
+
+    while True:
+        try:
+            if os.name == "nt":
+                # Windows rename refuses an existing destination, including on
+                # FAT/exFAT where hard links are unavailable.
+                os.rename(temp_path, target_path)
+            else:
+                # POSIX rename replaces files, so link the completed temp file
+                # instead. Both names are on the same filesystem. Fail safely
+                # if the filesystem cannot link; never fall back to overwrite.
+                os.link(temp_path, target_path)
+            return target_path
+        except FileExistsError as exc:
+            if overwrite_policy == OVERWRITE_SKIP:
+                return None
+            if overwrite_policy == OVERWRITE_ERROR:
+                raise ConversionError(f"Target file already exists: {target_path}") from exc
+            target_path = _renamed_path(rename_base)
 
 
 def _temporary_output_file(target_path: Path) -> tuple[Path, int]:
-    prefix = f".heictojpg-{target_path.stem}-"
-    suffix = f"{target_path.suffix}.tmp"
-    descriptor, name = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=target_path.parent)
+    # Do not embed the source name: a valid long filename can exceed NAME_MAX
+    # once the temporary prefix, random suffix and extension are appended.
+    descriptor, name = tempfile.mkstemp(prefix=".heictojpg-", suffix=".tmp", dir=target_path.parent)
     return Path(name), descriptor
 
 

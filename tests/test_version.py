@@ -11,7 +11,6 @@ from heictojpg import __version__ as package_version
 from heictojpg.cli import main
 from heictojpg.version import __version__, format_app_title
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 

@@ -396,7 +396,7 @@ def _write_sample_heic(path: Path) -> None:
     image = Image.new("RGB", (8, 6), (80, 120, 200))
     try:
         image.save(path, format="HEIF")
-    except Exception as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         pytest.skip(f"HEIF encoding is unavailable in this environment: {exc}")
 
 

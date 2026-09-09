@@ -171,13 +171,15 @@ def test_converter_window_reports_output_folder_open_failure(
     window.root = object()
     warnings: list[tuple[str, str, object]] = []
 
-    def fail_startfile(_folder: str) -> None:
+    def fail_open_folder(_command: object) -> None:
         raise OSError("simulated shell failure")
 
     def capture_warning(title: str, message: str, *, parent: object) -> None:
         warnings.append((title, message, parent))
 
-    monkeypatch.setattr(app_gui_module.os, "startfile", fail_startfile)
+    # Exercise the actual platform dispatch without launching an external program.
+    monkeypatch.setattr(app_gui_module.os, "startfile", fail_open_folder, raising=False)
+    monkeypatch.setattr(app_gui_module.subprocess, "Popen", fail_open_folder)
     monkeypatch.setattr(app_gui_module.messagebox, "showwarning", capture_warning)
     result = ConversionResult(source=tmp_path / "source.png", target=tmp_path / "output.jpg")
 

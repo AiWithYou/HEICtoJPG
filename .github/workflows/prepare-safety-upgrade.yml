@@ -1,0 +1,79 @@
+name: Prepare safety upgrade
+
+on:
+  push:
+    branches: ['maintenance/safety-v1.1.1']
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/maintenance/safety-v1.1.1'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Apply reviewed safety patch
+        run: python scripts/_safety_upgrade.py
+      - name: Install dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Repair mechanical quality violations
+        run: |
+          python -m ruff check --fix heictojpg tests scripts/capture_readme_screenshots.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m ruff format heictojpg tests scripts/capture_readme_screenshots.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m ruff check heictojpg tests scripts/capture_readme_screenshots.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m ruff format --check heictojpg tests scripts/capture_readme_screenshots.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test actual codecs and application
+        run: python -m pytest -q -rA
+      - name: Commit validated changes to maintenance branch only
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add heictojpg tests scripts/capture_readme_screenshots.py pyproject.toml
+          git diff --cached --check
+          git commit -m 'Validate v1.1.1 safety fixes and repair quality checks'
+          git push origin HEAD:refs/heads/maintenance/safety-v1.1.1
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  compatibility:
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            python: '3.10'
+            minimum: true
+          - os: ubuntu-latest
+            python: '3.12'
+            minimum: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e ".[dev]"
+      - if: matrix.minimum
+        run: python -m pip install 'Pillow==10.4.0' 'pillow-heif==0.18.0'
+      - run: python -m ruff check heictojpg tests scripts/capture_readme_screenshots.py
+      - run: python -m ruff format --check heictojpg tests scripts/capture_readme_screenshots.py
+      - if: runner.os == 'Windows'
+        run: python -m pytest -q -rA
+      - if: runner.os == 'Linux'
+        run: xvfb-run -a python -m pytest -q -rA

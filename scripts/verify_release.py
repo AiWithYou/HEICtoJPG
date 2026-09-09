@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import os
@@ -207,6 +208,33 @@ def verify_cancel(work: Path, reports: Path) -> dict:
     return {"cancel": "passed", "restart": "passed", "completed_before_cancel": count}
 
 
+def run_isolated_case(args, reports: Path, case: str) -> dict:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--exe",
+        str(args.exe.resolve(strict=True)),
+        "--report-dir",
+        str(reports),
+        "--case",
+        case,
+    ]
+    if args.workspace_base is not None:
+        command.extend(["--workspace-base", str(args.workspace_base.resolve())])
+    with subprocess.Popen(command) as process:
+        try:
+            returncode = process.wait(timeout=180)
+        except subprocess.TimeoutExpired:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"], check=False, timeout=15
+            )
+            process.wait(timeout=15)
+            raise
+        if returncode:
+            raise subprocess.CalledProcessError(returncode, command)
+    return json.loads((reports / f"case-{case}.json").read_text(encoding="utf-8"))
+
+
 def main() -> None:
     # TkDnD uses OLE on the GUI thread. Select STA before importing pywinauto.
     sys.coinit_flags = 2
@@ -214,29 +242,49 @@ def main() -> None:
     parser.add_argument("--exe", type=Path, required=True)
     parser.add_argument("--report-dir", type=Path, required=True)
     parser.add_argument("--workspace-base", type=Path)
+    parser.add_argument("--case", choices=["en-jpeg", "ja-png", "ja-webp", "cancel"])
     args = parser.parse_args()
     exe = args.exe.resolve(strict=True)
     reports = args.report_dir.resolve()
     reports.mkdir(parents=True, exist_ok=True)
+    if args.case is None:
+        # A real application owns one Tk interpreter per process. Isolate test
+        # cases likewise: a later decoder thread must not garbage-collect an
+        # earlier case's destroyed Tk variables/interpreter.
+        cases = [
+            run_isolated_case(args, reports, case) for case in ["en-jpeg", "ja-png", "ja-webp"]
+        ]
+        cancellation = run_isolated_case(args, reports, "cancel")
+        result = {
+            "version": __version__,
+            "exe_sha256": hashlib.sha256(exe.read_bytes()).hexdigest(),
+            "workspaces": [record["workspace"] for record in [*cases, cancellation]],
+            "cases": [record["result"] for record in cases],
+            "cancellation": cancellation["result"],
+            "physical_usb_tested": False,
+        }
+        (reports / "gui-verification.json").write_text(
+            json.dumps(result, indent=2) + "\n", encoding="utf-8"
+        )
+        print(json.dumps(result, indent=2), flush=True)
+        return
+
     old_appdata = os.environ.get("APPDATA")
     try:
         with tempfile.TemporaryDirectory(dir=args.workspace_base, prefix="heic-release-") as name:
             work = Path(name)
             os.environ["APPDATA"] = str(work / "appdata")
-            result = {
-                "version": __version__,
-                "exe_sha256": hashlib.sha256(exe.read_bytes()).hexdigest(),
-                "workspace": str(work),
-                "cases": [],
-                "physical_usb_tested": False,
-            }
-            for language, fmt in [("en", "jpeg"), ("ja", "png"), ("ja", "webp")]:
-                result["cases"].append(verify_case(exe, work, reports, language, fmt))
-            result["cancellation"] = verify_cancel(work, reports)
-            (reports / "gui-verification.json").write_text(
-                json.dumps(result, indent=2) + "\n", encoding="utf-8"
+            if args.case == "cancel":
+                case_result = verify_cancel(work, reports)
+            else:
+                language, fmt = args.case.split("-", 1)
+                case_result = verify_case(exe, work, reports, language, fmt)
+            # Finalize unreachable GUI cycles on the interpreter-owning thread.
+            gc.collect()
+            record = {"workspace": str(work), "result": case_result}
+            (reports / f"case-{args.case}.json").write_text(
+                json.dumps(record, indent=2) + "\n", encoding="utf-8"
             )
-            print(json.dumps(result, indent=2))
     finally:
         if old_appdata is None:
             os.environ.pop("APPDATA", None)

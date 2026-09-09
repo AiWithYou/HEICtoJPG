@@ -8,7 +8,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-
 APP_NAME = "HEIC Converter"
 APP_DIR_NAME = "HEICtoJPG"
 CONFIG_FILENAME = "config.json"

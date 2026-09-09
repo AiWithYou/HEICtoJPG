@@ -26,7 +26,6 @@ from heictojpg.config import (
 from heictojpg.converter import is_webp_supported
 from heictojpg.version import format_app_title
 
-
 SETTINGS_TITLE = f"{format_app_title(APP_NAME)} Settings"
 SETTINGS_TITLE_JA = f"{format_app_title(APP_NAME)} 設定"
 

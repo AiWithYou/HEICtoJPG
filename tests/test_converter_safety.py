@@ -20,7 +20,6 @@ from heictojpg.config import (
     AppConfig,
 )
 
-
 FORMATS = [FORMAT_JPEG, FORMAT_PNG, FORMAT_WEBP]
 SENTINEL = b"An existing file must not be overwritten accidentally."
 
@@ -98,7 +97,9 @@ def test_metadata_controls_preserve_only_requested_metadata(
         assert image.info.get("icc_profile") == (profile if keep_icc else None)
 
 
-@pytest.mark.parametrize("mode,transparent,opaque", [("RGB", (0, 0, 0), (255, 0, 0)), ("L", 0, 255)])
+@pytest.mark.parametrize(
+    "mode,transparent,opaque", [("RGB", (0, 0, 0), (255, 0, 0)), ("L", 0, 255)]
+)
 def test_webp_preserves_png_color_key_transparency(
     tmp_path: Path, mode: str, transparent: object, opaque: object
 ) -> None:
@@ -107,9 +108,7 @@ def test_webp_preserves_png_color_key_transparency(
         image.putdata([transparent, opaque])
         image.save(source, transparency=transparent)
 
-    result = converter.convert_file(
-        source, settings=settings_for(FORMAT_WEBP, webp_lossless=True)
-    )
+    result = converter.convert_file(source, settings=settings_for(FORMAT_WEBP, webp_lossless=True))
 
     with Image.open(result.target) as image:
         rgba = image.convert("RGBA")

@@ -13,7 +13,6 @@ from heictojpg.app_gui import ConverterWindow
 from heictojpg.config import LANGUAGE_EN, LANGUAGE_JA
 from heictojpg.gui import SettingsWindow
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 IMAGE_DIR = PROJECT_ROOT / "docs" / "images"
 

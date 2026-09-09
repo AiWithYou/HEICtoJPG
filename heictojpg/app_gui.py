@@ -48,7 +48,6 @@ from heictojpg.converter import (
 )
 from heictojpg.version import format_app_title
 
-
 IMAGE_FILE_PATTERNS = " ".join(f"*{suffix}" for suffix in sorted(SUPPORTED_SOURCE_SUFFIXES))
 FORMAT_LABELS = {
     FORMAT_JPEG: "JPEG (.jpg)",
@@ -881,7 +880,7 @@ class ConverterWindow:
         return self.config.output_format
 
     def _on_drop(self, event: object) -> None:
-        data = getattr(event, "data")
+        data = event.data
         self.add_paths(parse_drop_data(data))
 
     def _on_overwrite_selected(self, _event: object | None = None) -> None:

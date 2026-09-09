@@ -4,23 +4,23 @@ import argparse
 import os
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
+from heictojpg.app_gui import run_converter_app
 from heictojpg.config import (
     APP_NAME,
     FORMAT_JPEG,
     FORMAT_PNG,
     FORMAT_WEBP,
     OUTPUT_MODE_FIXED_FOLDER,
-    OVERWRITE_POLICIES,
     OVERWRITE_OVERWRITE,
+    OVERWRITE_POLICIES,
     AppConfig,
     ConfigError,
     load_config,
     validate_config,
 )
-from heictojpg.app_gui import run_converter_app
 from heictojpg.converter import ConversionError, convert_files, convert_folder
 from heictojpg.gui import run_settings_app
 from heictojpg.version import __version__
@@ -295,8 +295,8 @@ def _print_results(results: list[object]) -> None:
         return
     for result in results:
         status = getattr(result, "status", "converted")
-        source = getattr(result, "source")
-        target = getattr(result, "target")
+        source = result.source
+        target = result.target
         if status == "skipped":
             _write_line(f"Skipped: {source} -> {target}")
         elif status == "failed":
@@ -325,7 +325,7 @@ def _result_counts(results: list[object]) -> tuple[int, int, int]:
 def _open_result_folders(results: list[object]) -> bool:
     folders = sorted(
         {
-            str(getattr(result, "target").parent)
+            str(result.target.parent)
             for result in results
             if getattr(result, "status", "converted") != "failed"
         }
@@ -369,7 +369,7 @@ def _show_error_dialog(title: str, message: str, *, enabled: bool) -> None:
         from tkinter import messagebox
 
         messagebox.showerror(title, message)
-    except Exception:
+    except Exception:  # noqa: BLE001 - a best-effort dialog must not hide the original error.
         return
 
 
